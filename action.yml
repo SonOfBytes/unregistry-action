@@ -1,0 +1,119 @@
+name: "Unregistry Docker Push Action"
+description: "Push Docker images directly to remote servers via SSH using unregistry (docker pussh) - skip registry complexity"
+author: "sonofbytes"
+
+branding:
+  icon: "upload-cloud"
+  color: "blue"
+
+inputs:
+  image:
+    description: "Docker image name:tag to push (must exist in local Docker daemon)"
+    required: true
+  destination:
+    description: "SSH destination (user@host or host, with optional :port) for the remote Docker host"
+    required: true
+  platform:
+    description: "Optional platform to push (e.g., linux/amd64) for multi-arch images"
+    required: false
+    default: ""
+  ssh_key:
+    description: "Optional SSH private key for authentication (will be masked in logs)"
+    required: false
+    default: ""
+
+runs:
+  using: "composite"
+  steps:
+    # Step 1: Fail early on unsupported Windows runners
+    - name: Check runner OS compatibility
+      if: runner.os == 'Windows'
+      shell: bash
+      run: |
+        echo "::error::unregistry (docker-pussh) is not supported on Windows runners. Please use ubuntu-latest."
+        exit 1
+
+    # Step 2: Install docker-pussh
+    - name: Install docker-pussh
+      shell: bash
+      run: |
+        echo "Installing docker-pussh..."
+        # Create Docker CLI plugins directory
+        mkdir -p ~/.docker/cli-plugins
+        
+        # Download docker-pussh binary from upstream
+        curl -sSL "https://raw.githubusercontent.com/psviderski/unregistry/main/docker-pussh" \
+          -o ~/.docker/cli-plugins/docker-pussh
+        
+        # Make executable
+        chmod +x ~/.docker/cli-plugins/docker-pussh
+        
+        # Verify installation
+        docker pussh --help >/dev/null
+        echo "docker-pussh installed successfully"
+
+    # Step 4: Setup SSH key if provided
+    - name: Configure SSH key
+      if: inputs.ssh_key != ''
+      shell: bash
+      run: |
+        echo "Setting up SSH key for authentication..."
+        # Write SSH key to temporary file with secure permissions
+        echo "${{ inputs.ssh_key }}" > /tmp/unregistry_ssh_key
+        chmod 600 /tmp/unregistry_ssh_key
+        
+        # Add to SSH agent if available, otherwise rely on file-based auth
+        if command -v ssh-add >/dev/null && [ -n "$SSH_AUTH_SOCK" ]; then
+          ssh-add /tmp/unregistry_ssh_key 2>/dev/null || true
+        fi
+        
+        echo "SSH key configured"
+
+    # Step 5: Execute docker pussh with all options
+    - name: Push Docker image to remote server
+      shell: bash
+      env:
+        PUSSH_IMAGE: ${{ inputs.image }}
+        PUSSH_DESTINATION: ${{ inputs.destination }}
+        PUSSH_PLATFORM: ${{ inputs.platform }}
+        PUSSH_SSH_KEY: ${{ inputs.ssh_key }}
+      run: |
+        echo "Pushing Docker image to remote server..."
+        echo "Image: $PUSSH_IMAGE"
+        echo "Destination: $PUSSH_DESTINATION"
+        
+        # Build the docker pussh command
+        cmd="docker pussh"
+        
+        # Add platform option if specified
+        if [ -n "$PUSSH_PLATFORM" ]; then
+          cmd="$cmd --platform $PUSSH_PLATFORM"
+          echo "Platform: $PUSSH_PLATFORM"
+        fi
+        
+        # Add SSH key option if provided
+        if [ -n "$PUSSH_SSH_KEY" ]; then
+          cmd="$cmd -i /tmp/unregistry_ssh_key"
+          echo "Using provided SSH key for authentication"
+        fi
+        
+        # Add image and destination
+        cmd="$cmd $PUSSH_IMAGE $PUSSH_DESTINATION"
+        
+        echo "Executing: docker pussh [options] $PUSSH_IMAGE $PUSSH_DESTINATION"
+        
+        # Execute the push command
+        eval $cmd
+        
+        echo "✅ Successfully pushed $PUSSH_IMAGE to $PUSSH_DESTINATION"
+
+    # Step 6: Cleanup SSH key
+    - name: Cleanup SSH key
+      if: always() && inputs.ssh_key != ''
+      shell: bash
+      run: |
+        # Remove temporary SSH key file
+        if [ -f /tmp/unregistry_ssh_key ]; then
+          rm -f /tmp/unregistry_ssh_key
+          echo "SSH key file cleaned up"
+        fi

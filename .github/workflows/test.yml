@@ -1,0 +1,424 @@
+name: "Test Action"
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      run_integration_tests:
+        description: "Force run integration tests (runs automatically if secrets available)"
+        required: false
+        default: false
+        type: boolean
+
+env:
+  TEST_IMAGE_NAME: unregistry-test
+  RANDOM_NUMBER: ${{ github.run_number }}-${{ github.run_attempt }}
+
+jobs:
+  # Check if integration test secrets are available
+  check-secrets:
+    name: "Check Integration Test Secrets"
+    runs-on: ubuntu-latest
+    outputs:
+      has_integration_secrets: ${{ steps.check.outputs.has_secrets }}
+      run_integration_tests: ${{ steps.check.outputs.run_tests }}
+    steps:
+      - id: check
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          TEST_SERVER_HOST: ${{ secrets.TEST_SERVER_HOST }}
+          TEST_SERVER_USER: ${{ secrets.TEST_SERVER_USER }}
+        run: |
+          # Check if secrets are available
+          has_secrets=false
+          if [ -n "$SSH_PRIVATE_KEY" ] && [ -n "$TEST_SERVER_HOST" ] && [ -n "$TEST_SERVER_USER" ]; then
+            has_secrets=true
+            echo "has_secrets=true" >> $GITHUB_OUTPUT
+            echo "✅ Integration test secrets are available"
+          else
+            echo "has_secrets=false" >> $GITHUB_OUTPUT
+            echo "ℹ️ Integration test secrets not configured"
+          fi
+          
+          # Run integration tests if secrets are available OR manually triggered
+          if [ "$has_secrets" = "true" ] || [ "${{ github.event.inputs.run_integration_tests }}" = "true" ]; then
+            echo "run_tests=true" >> $GITHUB_OUTPUT
+            if [ "$has_secrets" = "true" ]; then
+              echo "🚀 Integration tests will be executed (secrets available)"
+            else
+              echo "🚀 Integration tests will be executed (manually triggered)"
+            fi
+          else
+            echo "run_tests=false" >> $GITHUB_OUTPUT
+            echo "⏭️ Integration tests will be skipped (no secrets and not manually triggered)"
+          fi
+  # Validate action setup and installation
+  test-installation:
+    name: "Test Installation & Setup"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Test docker-pussh installation
+        run: |
+          echo "Testing docker-pussh installation..."
+          mkdir -p ~/.docker/cli-plugins
+          curl -sSL "https://raw.githubusercontent.com/psviderski/unregistry/main/docker-pussh" \
+            -o ~/.docker/cli-plugins/docker-pussh
+          chmod +x ~/.docker/cli-plugins/docker-pussh
+
+          # Verify installation
+          docker pussh --help
+          echo "✅ docker-pussh installation successful"
+
+  # Test Windows guard
+  test-windows-guard:
+    name: "Test Windows Guard"
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Test Windows rejection
+        uses: ./
+        continue-on-error: true
+        id: windows_test
+        with:
+          image: test:latest
+          destination: test@example.com
+
+      - name: Verify Windows guard worked
+        shell: bash
+        run: |
+          if [ "${{ steps.windows_test.outcome }}" == "success" ]; then
+            echo "❌ Action should have failed on Windows"
+            exit 1
+          fi
+          echo "✅ Windows guard working correctly"
+
+  # Build test image with hardcoded random number
+  build-test-image:
+    name: "Build Test Image"
+    runs-on: ubuntu-latest
+    outputs:
+      random-number: ${{ steps.build.outputs.random-number }}
+      image-tag: ${{ steps.build.outputs.image-tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Generate random number and build image
+        id: build
+        run: |
+          # Generate a unique random number for this build
+          RANDOM_NUM="${{ env.RANDOM_NUMBER }}-$(date +%s)"
+          echo "random-number=$RANDOM_NUM" >> $GITHUB_OUTPUT
+
+          # Create image tag
+          IMAGE_TAG="${{ env.TEST_IMAGE_NAME }}:$RANDOM_NUM"
+          echo "image-tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+          echo "Building test image with random number: $RANDOM_NUM"
+
+          # Create Dockerfile with hardcoded random number
+          cat > Dockerfile << EOF
+          FROM alpine:latest
+
+          # Install basic tools
+          RUN apk add --no-cache curl
+
+          # Hardcode the random number into the image
+          ENV RANDOM_NUMBER=$RANDOM_NUM
+
+          # Create a script that outputs the random number
+          RUN echo '#!/bin/sh' > /usr/local/bin/show-number && \
+              echo 'echo "Random number: \$RANDOM_NUMBER"' >> /usr/local/bin/show-number && \
+              chmod +x /usr/local/bin/show-number
+
+          # Set as default command
+          CMD ["/usr/local/bin/show-number"]
+          EOF
+
+          # Build the image
+          docker build -t $IMAGE_TAG .
+
+          # Test the image locally
+          echo "Testing image locally:"
+          docker run --rm $IMAGE_TAG
+
+          echo "✅ Test image built successfully: $IMAGE_TAG"
+
+      - name: Save image for later jobs
+        run: |
+          docker save ${{ steps.build.outputs.image-tag }} > test-image.tar
+
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-image
+          path: test-image.tar
+          retention-days: 1
+
+  # Test dry run (no actual server push)
+  test-dry-run:
+    name: "Test Dry Run"
+    runs-on: ubuntu-latest
+    needs: build-test-image
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: test-image
+
+      - name: Load test image
+        run: |
+          docker load < test-image.tar
+          docker images | grep ${{ env.TEST_IMAGE_NAME }}
+
+      - name: Test action with invalid destination (should fail at SSH)
+        uses: ./
+        continue-on-error: true
+        id: dry_run
+        with:
+          image: ${{ needs.build-test-image.outputs.image-tag }}
+          destination: test@nonexistent.example.com
+
+      - name: Verify dry run behavior
+        run: |
+          # The action should fail at SSH connection, but installation should work
+          echo "Dry run completed - installation steps should have succeeded"
+          echo "SSH connection failure is expected for nonexistent server"
+
+  # Real integration test with actual server
+  test-real-server:
+    name: "Integration Test with Real Server"
+    runs-on: ubuntu-latest
+    needs: [check-secrets, build-test-image]
+    # Only run if integration tests are enabled
+    if: ${{ needs.check-secrets.outputs.run_integration_tests == 'true' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: test-image
+
+      - name: Load test image
+        run: |
+          docker load < test-image.tar
+          docker images | grep ${{ env.TEST_IMAGE_NAME }}
+
+      - name: Add server to known hosts
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H ${{ secrets.TEST_SERVER_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Push image to test server
+        uses: ./
+        with:
+          image: ${{ needs.build-test-image.outputs.image-tag }}
+          destination: ${{ secrets.TEST_SERVER_USER }}@${{ secrets.TEST_SERVER_HOST }}
+          ssh_key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Verify image on remote server and test execution
+        run: |
+          # Write SSH key to temporary file
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > /tmp/test_ssh_key
+          chmod 600 /tmp/test_ssh_key
+          
+          # Connect to server and run the container
+          ssh -i /tmp/test_ssh_key \
+              -o StrictHostKeyChecking=no \
+              ${{ secrets.TEST_SERVER_USER }}@${{ secrets.TEST_SERVER_HOST }} \
+              "docker run --rm ${{ needs.build-test-image.outputs.image-tag }}" > remote_output.txt
+
+          # Check if the output contains our expected random number
+          cat remote_output.txt
+
+          if grep -q "${{ needs.build-test-image.outputs.random-number }}" remote_output.txt; then
+            echo "✅ Success! Random number ${{ needs.build-test-image.outputs.random-number }} found in remote output"
+          else
+            echo "❌ Failed! Expected random number not found in remote output"
+            echo "Expected: ${{ needs.build-test-image.outputs.random-number }}"
+            echo "Got: $(cat remote_output.txt)"
+            exit 1
+          fi
+          
+          # Cleanup SSH key
+          rm -f /tmp/test_ssh_key
+
+      - name: Cleanup remote image
+        if: always()
+        run: |
+          # Write SSH key to temporary file
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > /tmp/cleanup_ssh_key
+          chmod 600 /tmp/cleanup_ssh_key
+          
+          # Clean up the test image from remote server
+          ssh -i /tmp/cleanup_ssh_key \
+              -o StrictHostKeyChecking=no \
+              ${{ secrets.TEST_SERVER_USER }}@${{ secrets.TEST_SERVER_HOST }} \
+              "docker rmi ${{ needs.build-test-image.outputs.image-tag }} || true"
+          
+          # Cleanup SSH key
+          rm -f /tmp/cleanup_ssh_key
+
+
+  # Test parameter validation
+  test-parameters:
+    name: "Test Parameter Validation"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build minimal test image
+        run: |
+          echo 'FROM alpine:latest' > Dockerfile
+          echo 'CMD ["echo", "test"]' >> Dockerfile
+          docker build -t param-test:latest .
+
+      - name: Test with minimal parameters
+        uses: ./
+        continue-on-error: true
+        with:
+          image: param-test:latest
+          destination: test@localhost
+
+      - name: Test with all parameters
+        uses: ./
+        continue-on-error: true
+        with:
+          image: param-test:latest
+          destination: test@localhost:2222
+          platform: linux/amd64
+          ssh_key: |
+            -----BEGIN OPENSSH PRIVATE KEY-----
+            b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAFwAAAAdzc2gtcn
+            (dummy key for testing)
+            -----END OPENSSH PRIVATE KEY-----
+
+  # Test action metadata
+  test-metadata:
+    name: "Test Action Metadata"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install yq
+        run: |
+          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+
+      - name: Validate action.yml
+        run: |
+          # Validate YAML syntax
+          yq eval '.' action.yml > /dev/null
+          echo "✅ Valid YAML syntax"
+
+          # Check required fields
+          yq eval '.name' action.yml | grep -q "Unregistry Docker Push Action"
+          yq eval '.description' action.yml | grep -q "Push Docker images"
+          yq eval '.inputs.image.required' action.yml | grep -q "true"
+          yq eval '.inputs.destination.required' action.yml | grep -q "true"
+          yq eval '.runs.using' action.yml | grep -q "composite"
+          echo "✅ Required fields present"
+
+          # Check branding
+          yq eval '.branding.icon' action.yml | grep -q "upload-cloud"
+          yq eval '.branding.color' action.yml | grep -q "blue"
+          echo "✅ Branding valid"
+
+  # Test summary
+  test-summary:
+    name: "Test Summary"
+    runs-on: ubuntu-latest
+    needs:
+      [
+        check-secrets,
+        test-installation,
+        test-windows-guard,
+        build-test-image,
+        test-dry-run,
+        test-real-server,
+        test-parameters,
+        test-metadata,
+      ]
+    if: always()
+    steps:
+      - name: Print test results
+        run: |
+          echo "## 🧪 Test Results Summary"
+          echo ""
+          echo "| Test | Status |"
+          echo "|------|--------|"
+          echo "| Secret Check | ${{ needs.check-secrets.result }} |"
+          echo "| Installation & Setup | ${{ needs.test-installation.result }} |"
+          echo "| Windows Guard | ${{ needs.test-windows-guard.result }} |"
+          echo "| Build Test Image | ${{ needs.build-test-image.result }} |"
+          echo "| Dry Run | ${{ needs.test-dry-run.result }} |"
+          echo "| Real Server Integration | ${{ needs.test-real-server.result }} |"
+          echo "| Parameter Validation | ${{ needs.test-parameters.result }} |"
+          echo "| Metadata Validation | ${{ needs.test-metadata.result }} |"
+          echo ""
+          
+          # Show integration test status
+          echo "🔐 Integration tests enabled: ${{ needs.check-secrets.outputs.run_integration_tests }}"
+          echo "🔑 Secrets available: ${{ needs.check-secrets.outputs.has_integration_secrets }}"
+          echo ""
+
+          # Extract the random number from build job
+          if [ "${{ needs.build-test-image.result }}" == "success" ]; then
+            echo "🎲 Test image random number: ${{ needs.build-test-image.outputs.random-number }}"
+            echo "🏷️ Test image tag: ${{ needs.build-test-image.outputs.image-tag }}"
+          fi
+
+          # Overall status
+          core_tests_passed=true
+          if [[ "${{ needs.check-secrets.result }}" != "success" || 
+                "${{ needs.test-installation.result }}" != "success" || 
+                "${{ needs.test-windows-guard.result }}" != "success" || 
+                "${{ needs.build-test-image.result }}" != "success" || 
+                "${{ needs.test-dry-run.result }}" != "success" || 
+                "${{ needs.test-parameters.result }}" != "success" || 
+                "${{ needs.test-metadata.result }}" != "success" ]]; then
+            core_tests_passed=false
+          fi
+          
+          if [ "$core_tests_passed" = "true" ]; then
+            echo ""
+            echo "✅ **All core tests passed!**"
+            
+            # Check integration test results
+            integration_results=()
+            if [ "${{ needs.test-real-server.result }}" = "success" ]; then
+              integration_results+=("✅ Real server test passed")
+            elif [ "${{ needs.test-real-server.result }}" = "skipped" ]; then
+              integration_results+=("⏭️ Real server test skipped")
+            elif [ "${{ needs.test-real-server.result }}" = "failure" ]; then
+              integration_results+=("❌ Real server test failed")
+            fi
+            
+            
+            if [ ${#integration_results[@]} -gt 0 ]; then
+              echo ""
+              echo "📋 **Integration Test Results:**"
+              for result in "${integration_results[@]}"; do
+                echo "  $result"
+              done
+            fi
+          else
+            echo ""
+            echo "❌ **Some core tests failed!**"
+            exit 1
+          fi

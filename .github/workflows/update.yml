@@ -1,0 +1,167 @@
+name: "Update Action to Latest Unregistry"
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Target unregistry version (e.g., 'v0.2.0'). Leave blank to auto-detect latest release."
+        required: false
+        type: string
+  schedule:
+    # Check for updates weekly on Mondays at 9 AM UTC
+    - cron: '0 9 * * 1'
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout action repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Determine target version
+        id: get_version
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            echo "Target version specified manually: ${{ github.event.inputs.version }}"
+            echo "target_version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+          else
+            echo "Fetching latest release from upstream..."
+            # Fetch latest release tag from upstream GitHub API
+            latest_version=$(curl -sSL \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              https://api.github.com/repos/psviderski/unregistry/releases/latest \
+              | jq -r '.tag_name')
+            
+            if [ "$latest_version" = "null" ] || [ -z "$latest_version" ]; then
+              echo "Failed to fetch latest version from upstream"
+              exit 1
+            fi
+            
+            echo "Latest upstream version: $latest_version"
+            echo "target_version=$latest_version" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Check current version
+        id: current_version
+        run: |
+          # Extract current version from action.yml (looking for the download URL)
+          current_version=$(grep -oP 'unregistry/\K[^/]+' action.yml | head -1 || echo "unknown")
+          echo "Current version in action.yml: $current_version"
+          echo "current_version=$current_version" >> $GITHUB_OUTPUT
+
+      - name: Compare versions
+        id: version_check
+        run: |
+          current="${{ steps.current_version.outputs.current_version }}"
+          target="${{ steps.get_version.outputs.target_version }}"
+          
+          echo "Comparing versions: $current vs $target"
+          
+          if [ "$current" = "$target" ]; then
+            echo "Versions are already in sync. No update needed."
+            echo "needs_update=false" >> $GITHUB_OUTPUT
+          else
+            echo "Update needed: $current -> $target"
+            echo "needs_update=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Update action version references
+        if: steps.version_check.outputs.needs_update == 'true'
+        run: |
+          target_version="${{ steps.get_version.outputs.target_version }}"
+          echo "Updating references to version: $target_version"
+          
+          # Update action.yml download URL
+          sed -i "s|https://raw.githubusercontent.com/psviderski/unregistry/[^/]*/docker-pussh|https://raw.githubusercontent.com/psviderski/unregistry/$target_version/docker-pussh|g" action.yml
+          
+          # Update README.md version references
+          # Update usage examples
+          sed -i "s|sonofbytes/unregistry-action@v[0-9]*\.[0-9]*\.[0-9]*|sonofbytes/unregistry-action@$target_version|g" README.md
+          
+          # Update versioning section
+          sed -i "s|- \`@v[0-9]*\.[0-9]*\.[0-9]*\` - Uses unregistry v[0-9]*\.[0-9]*\.[0-9]*|- \`@$target_version\` - Uses unregistry $target_version|g" README.md
+          
+          echo "Version references updated successfully"
+
+      - name: Verify changes
+        if: steps.version_check.outputs.needs_update == 'true'
+        run: |
+          echo "=== Changes made ==="
+          git diff --name-only
+          echo ""
+          echo "=== action.yml changes ==="
+          git diff action.yml || true
+          echo ""
+          echo "=== README.md changes ==="
+          git diff README.md || true
+
+      - name: Create Pull Request
+        if: steps.version_check.outputs.needs_update == 'true'
+        uses: peter-evans/create-pull-request@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "Update to unregistry ${{ steps.get_version.outputs.target_version }}"
+          title: "Update to unregistry ${{ steps.get_version.outputs.target_version }}"
+          body: |
+            ## 🚀 Update to unregistry ${{ steps.get_version.outputs.target_version }}
+            
+            This PR updates the action to use the latest version of unregistry.
+            
+            ### Changes
+            - Updated binary download URL in `action.yml`
+            - Updated version references in `README.md`
+            - Updated usage examples to reference the new action version
+            
+            ### Upstream Changes
+            See the upstream release notes: https://github.com/psviderski/unregistry/releases/tag/${{ steps.get_version.outputs.target_version }}
+            
+            ### Testing
+            - [ ] Test basic functionality on Linux runner
+            - [ ] Test SSH key authentication
+            - [ ] Test platform-specific pushes
+            - [ ] Verify error handling
+            
+            This PR was created automatically by the update workflow.
+          branch: update-to-${{ steps.get_version.outputs.target_version }}
+          delete-branch: true
+          draft: false
+
+      - name: Create release tag (manual trigger only)
+        if: steps.version_check.outputs.needs_update == 'true' && github.event_name == 'workflow_dispatch'
+        run: |
+          target_version="${{ steps.get_version.outputs.target_version }}"
+          echo "Creating release tag: $target_version"
+          
+          # Configure git
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # Only create tag if running manually (not on schedule)
+          # For scheduled runs, we create PR for review
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            git add action.yml README.md
+            git commit -m "Update to unregistry $target_version" || true
+            git tag -a "$target_version" -m "Release $target_version - Updated to unregistry $target_version"
+            git push origin main --follow-tags
+          fi
+
+      - name: Summary
+        run: |
+          if [ "${{ steps.version_check.outputs.needs_update }}" = "true" ]; then
+            echo "✅ Update processed successfully"
+            echo "Target version: ${{ steps.get_version.outputs.target_version }}"
+            if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+              echo "🏷️  Release tag created (manual trigger)"
+            else
+              echo "📋 Pull request created for review (scheduled trigger)"
+            fi
+          else
+            echo "ℹ️  No update needed - versions are in sync"
+          fi
