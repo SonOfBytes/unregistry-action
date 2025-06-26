@@ -21,6 +21,10 @@ inputs:
     description: "Optional SSH private key for authentication (will be masked in logs)"
     required: false
     default: ""
+  ssh_password:
+    description: "Optional SSH password for authentication (will be masked in logs). Cannot be used together with ssh_key."
+    required: false
+    default: ""
 
 runs:
   using: "composite"
@@ -33,11 +37,32 @@ runs:
         echo "::error::unregistry (docker-pussh) is not supported on Windows runners. Please use ubuntu-latest."
         exit 1
 
-    # Step 2: Install docker-pussh
-    - name: Install docker-pussh
+    # Step 2: Validate authentication inputs
+    - name: Validate authentication inputs
       shell: bash
       run: |
-        echo "Installing docker-pussh..."
+        if [[ -n "${{ inputs.ssh_key }}" && -n "${{ inputs.ssh_password }}" ]]; then
+          echo "::error::Cannot specify both ssh_key and ssh_password. Please provide only one authentication method."
+          exit 1
+        fi
+        
+        if [[ -z "${{ inputs.ssh_key }}" && -z "${{ inputs.ssh_password }}" ]]; then
+          echo "::warning::No SSH authentication provided. Attempting connection without explicit authentication (relies on SSH agent or default keys)."
+        fi
+
+    # Step 3: Install docker-pussh and dependencies
+    - name: Install docker-pussh and dependencies
+      shell: bash
+      run: |
+        echo "Installing docker-pussh and dependencies..."
+        
+        # Install sshpass if password authentication is used
+        if [ -n "${{ inputs.ssh_password }}" ]; then
+          echo "Installing sshpass for password authentication..."
+          sudo apt-get update -qq
+          sudo apt-get install -y sshpass
+        fi
+        
         # Create Docker CLI plugins directory
         mkdir -p ~/.docker/cli-plugins
         
@@ -69,7 +94,20 @@ runs:
         
         echo "SSH key configured"
 
-    # Step 5: Execute docker pussh with all options
+    # Step 5: Setup SSH password environment if provided
+    - name: Configure SSH password authentication
+      if: inputs.ssh_password != ''
+      shell: bash
+      run: |
+        echo "Setting up SSH password authentication..."
+        # Mask the password in logs
+        echo "::add-mask::${{ inputs.ssh_password }}"
+        
+        # Set environment variable for sshpass
+        echo "SSHPASS=${{ inputs.ssh_password }}" >> $GITHUB_ENV
+        echo "SSH password authentication configured"
+
+    # Step 6: Execute docker pussh with all options
     - name: Push Docker image to remote server
       shell: bash
       env:
@@ -77,10 +115,52 @@ runs:
         PUSSH_DESTINATION: ${{ inputs.destination }}
         PUSSH_PLATFORM: ${{ inputs.platform }}
         PUSSH_SSH_KEY: ${{ inputs.ssh_key }}
+        PUSSH_SSH_PASSWORD: ${{ inputs.ssh_password }}
       run: |
         echo "Pushing Docker image to remote server..."
         echo "Image: $PUSSH_IMAGE"
         echo "Destination: $PUSSH_DESTINATION"
+        
+        # Parse destination to extract components for SSH connection test
+        if [[ "$PUSSH_DESTINATION" =~ ^(([^@]+)@)?([^:]+)(:([0-9]+))?$ ]]; then
+          SSH_USER="${BASH_REMATCH[2]}"
+          SSH_HOST="${BASH_REMATCH[3]}"
+          SSH_PORT="${BASH_REMATCH[5]:-22}"
+          
+          # Construct user@host format
+          if [ -n "$SSH_USER" ]; then
+            SSH_USER_HOST="$SSH_USER@$SSH_HOST"
+          else
+            SSH_USER_HOST="$SSH_HOST"
+          fi
+        else
+          echo "::error::Invalid destination format. Expected [user@]host[:port]"
+          exit 1
+        fi
+        
+        echo "Parsed destination - User: ${SSH_USER:-default}, Host: $SSH_HOST, Port: $SSH_PORT"
+        
+        # Test SSH connection first
+        echo "Testing SSH connection to $SSH_USER_HOST..."
+        if [ -n "$PUSSH_SSH_PASSWORD" ]; then
+          # Test with password authentication
+          if ! sshpass -e ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no -p "$SSH_PORT" "$SSH_USER_HOST" "echo 'SSH connection successful'"; then
+            echo "::error::Failed to establish SSH connection using password authentication"
+            exit 1
+          fi
+        elif [ -n "$PUSSH_SSH_KEY" ]; then
+          # Test with key authentication
+          if ! ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no -i /tmp/unregistry_ssh_key -p "$SSH_PORT" "$SSH_USER_HOST" "echo 'SSH connection successful'"; then
+            echo "::error::Failed to establish SSH connection using SSH key"
+            exit 1
+          fi
+        else
+          # Test with default authentication (SSH agent or default keys)
+          if ! ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no -p "$SSH_PORT" "$SSH_USER_HOST" "echo 'SSH connection successful'"; then
+            echo "::error::Failed to establish SSH connection using default authentication"
+            exit 1
+          fi
+        fi
         
         # Build the docker pussh command
         cmd="docker pussh"
@@ -91,29 +171,52 @@ runs:
           echo "Platform: $PUSSH_PLATFORM"
         fi
         
-        # Add SSH key option if provided
-        if [ -n "$PUSSH_SSH_KEY" ]; then
+        # Add SSH authentication options
+        if [ -n "$PUSSH_SSH_PASSWORD" ]; then
+          echo "::warning::SSH password authentication has limitations with docker pussh. Consider using SSH key authentication for better reliability."
+          echo "Using SSH password authentication with sshpass wrapper"
+          
+          # For password authentication, we'll use sshpass to wrap the docker pussh command
+          # This is a workaround since docker pussh may not directly support password auth
+          cmd="sshpass -e $cmd"
+          
+        elif [ -n "$PUSSH_SSH_KEY" ]; then
           cmd="$cmd -i /tmp/unregistry_ssh_key"
           echo "Using provided SSH key for authentication"
+          cmd="$cmd $PUSSH_IMAGE $PUSSH_DESTINATION"
+        else
+          echo "Using default SSH authentication (SSH agent or default keys)"
+          cmd="$cmd $PUSSH_IMAGE $PUSSH_DESTINATION"
         fi
         
-        # Add image and destination
-        cmd="$cmd $PUSSH_IMAGE $PUSSH_DESTINATION"
-        
-        echo "Executing: docker pussh [options] $PUSSH_IMAGE $PUSSH_DESTINATION"
+        echo "Executing docker pussh command..."
         
         # Execute the push command
-        eval $cmd
+        eval "$cmd"
         
         echo "✅ Successfully pushed $PUSSH_IMAGE to $PUSSH_DESTINATION"
 
-    # Step 6: Cleanup SSH key
-    - name: Cleanup SSH key
-      if: always() && inputs.ssh_key != ''
+    # Step 7: Cleanup
+    - name: Cleanup authentication files
+      if: always()
       shell: bash
       run: |
         # Remove temporary SSH key file
         if [ -f /tmp/unregistry_ssh_key ]; then
           rm -f /tmp/unregistry_ssh_key
           echo "SSH key file cleaned up"
+        fi
+        
+        # Remove temporary SSH config files if any exist
+        for config_file in "$HOME"/.ssh/config_unregistry_*; do
+          if [ -f "$config_file" ]; then
+            rm -f "$config_file"
+            echo "Temporary SSH config file cleaned up: $config_file"
+          fi
+        done
+        
+        # Clear password from environment
+        if [ -n "${{ inputs.ssh_password }}" ]; then
+          unset SSHPASS
+          echo "SSH password cleared from environment"
         fi
