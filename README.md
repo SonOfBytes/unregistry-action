@@ -30,6 +30,32 @@ jobs:
           ssh_key: ${{ secrets.SSH_PRIVATE_KEY }}
 ```
 
+### Using SSH Password Authentication
+
+```yaml
+name: Deploy
+on: [push]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -t myapp:${{ github.sha }} .
+
+      - name: Add server to known hosts
+        run: ssh-keyscan -H prod-server.com >> ~/.ssh/known_hosts
+
+      - name: Deploy to server
+        uses: sonofbytes/unregistry-action@v0.1.0
+        with:
+          image: myapp:${{ github.sha }}
+          destination: deploy@prod-server.com
+          ssh_password: ${{ secrets.SSH_PASSWORD }}
+```
+
 ## Why Use This
 
 - **Skip registry complexity** - No need for Docker Hub, ECR, or private registries
@@ -39,16 +65,19 @@ jobs:
 
 ## Inputs
 
-| Name          | Description                                       | Required | Default |
-| ------------- | ------------------------------------------------- | -------- | ------- |
-| `image`       | Docker image name:tag (must exist locally)        | Yes      | -       |
-| `destination` | SSH destination (user@host or user@host:port)     | Yes      | -       |
-| `ssh_key`     | SSH private key content                           | No       | -       |
-| `platform`    | Platform for multi-arch images (e.g. linux/amd64) | No       | -       |
+| Name           | Description                                         | Required | Default |
+| -------------- | --------------------------------------------------- | -------- | ------- |
+| `image`        | Docker image name:tag (must exist locally)          | Yes      | -       |
+| `destination`  | SSH destination (user@host or user@host:port)       | Yes      | -       |
+| `ssh_key`      | SSH private key content                             | No       | -       |
+| `ssh_password` | SSH password for authentication                     | No       | -       |
+| `platform`     | Platform for multi-arch images (e.g. linux/amd64)  | No       | -       |
+
+**Note**: You cannot specify both `ssh_key` and `ssh_password` at the same time. Choose one authentication method.
 
 ## Examples
 
-### Basic deployment
+### Basic deployment with SSH key
 
 ```yaml
 - name: Deploy to production
@@ -58,6 +87,18 @@ jobs:
     destination: root@server.example.com
     # destination: deploy@10.0.0.100:2222  # for custom SSH port
     ssh_key: ${{ secrets.SERVER_SSH_KEY }}
+    # platform: linux/arm64  # for multi-platform images
+```
+
+### Basic deployment with SSH password
+
+```yaml
+- name: Deploy to production
+  uses: sonofbytes/unregistry-action@v0.1.0
+  with:
+    image: webapp:latest
+    destination: root@server.example.com
+    ssh_password: ${{ secrets.SERVER_SSH_PASSWORD }}
     # platform: linux/arm64  # for multi-platform images
 ```
 
@@ -93,6 +134,8 @@ jobs:
 
 ## SSH Setup
 
+### Option 1: SSH Key Authentication (Recommended)
+
 Generate an SSH key pair if needed:
 
 ```bash
@@ -107,6 +150,24 @@ ssh-copy-id user@server.com
 
 Add the private key to GitHub repository secrets (Settings → Secrets → Actions).
 
+### Option 2: SSH Password Authentication
+
+For password authentication, ensure your server allows password authentication:
+
+1. Edit `/etc/ssh/sshd_config` on your server:
+   ```
+   PasswordAuthentication yes
+   ```
+
+2. Restart SSH service:
+   ```bash
+   sudo systemctl restart ssh
+   ```
+
+3. Add the SSH password to GitHub repository secrets (Settings → Secrets → Actions).
+
+**Security Note**: SSH key authentication is generally more secure than password authentication and is the recommended approach.
+
 ## Avoiding Host Key Errors
 
 Add your server's host key to avoid verification failures:
@@ -118,13 +179,19 @@ Add your server's host key to avoid verification failures:
 
 ## Troubleshooting
 
-**Permission denied:** Check that your SSH key is correct and the public key is installed on the server.
+**Permission denied (SSH key):** Check that your SSH key is correct and the public key is installed on the server.
+
+**Permission denied (SSH password):** Verify the password is correct and that PasswordAuthentication is enabled in the server's SSH configuration.
 
 **Cannot connect to Docker daemon:** Ensure Docker is running and the SSH user can execute Docker commands.
 
 **Image not found:** Build or pull the image before running this action.
 
 **Connection timeout:** Verify network connectivity and SSH port accessibility.
+
+**sshpass not found:** This error should not occur as the action automatically installs sshpass when using password authentication.
+
+**Both ssh_key and ssh_password provided:** The action will fail with an error. Use only one authentication method.
 
 ## How It Works
 
