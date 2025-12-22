@@ -23,7 +23,7 @@ jobs:
         run: ssh-keyscan -H prod-server.com >> ~/.ssh/known_hosts
 
       - name: Deploy to server
-        uses: sonofbytes/unregistry-action@v0.1.0
+        uses: sonofbytes/unregistry-action@v0.4.1
         with:
           image: myapp:${{ github.sha }}
           destination: deploy@prod-server.com
@@ -52,7 +52,7 @@ jobs:
 
 ```yaml
 - name: Deploy to production
-  uses: sonofbytes/unregistry-action@v0.1.0
+  uses: sonofbytes/unregistry-action@v0.4.1
   with:
     image: webapp:latest
     destination: root@server.example.com
@@ -70,7 +70,7 @@ jobs:
     ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
 
 - name: Deploy
-  uses: sonofbytes/unregistry-action@v0.1.0
+  uses: sonofbytes/unregistry-action@v0.4.1
   with:
     image: myapp:latest
     destination: deploy@server.com
